@@ -14,12 +14,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -29,6 +31,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -65,6 +68,21 @@ var regionsUpstream = map[string]string{
 	"cdn.static.wotb.app":          "34.117.103.161",
 	"dl-wotblitz-gc.wargaming.net": "92.223.95.95",
 }
+
+var vtEnabled = false
+
+func colorize(code, s string) string {
+	if vtEnabled {
+		return "\x1b[" + code + "m" + s + "\x1b[0m"
+	}
+	return s
+}
+
+func red(s string) string   { return colorize("91", s) }
+func green(s string) string { return colorize("92", s) }
+func blue(s string) string  { return colorize("94", s) }
+
+var stdin = bufio.NewReader(os.Stdin)
 
 func syscallSetUTF8() {
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
@@ -215,7 +233,8 @@ func ensureCerts() error {
 	caPath := filepath.Join(certDir, "ca.cer")
 	if _, err := os.Stat(certPath); err == nil {
 		if _, err2 := os.Stat(keyPath); err2 == nil {
-			return nil // 已有证书,沿用
+			extractCAFile(certPath, caPath) // 旧证书链也补出 ca.cer 供模拟器安装
+			return nil
 		}
 	}
 	if err := os.MkdirAll(certDir, 0755); err != nil {
@@ -289,6 +308,11 @@ var (
 	tokTS   time.Time
 	tokInit bool
 )
+
+func tokenFresh() bool {
+	st, err := os.Stat(tokenDisk)
+	return err == nil && time.Since(st.ModTime()) < tokenMaxAge
+}
 
 func loadToken() map[string]interface{} {
 	tokMu.Lock()
@@ -734,6 +758,189 @@ func stripScope(body []byte) []byte {
 	return []byte(strings.Join(out, "&"))
 }
 
+// ---------- 模拟器自动收割 ----------
+var (
+	mumuDirFlag  = flag.String("mumu", "", "MuMu 安装目录(默认自动探测注册表/常见路径)")
+	adbSerialFl  = flag.String("adb-serial", "127.0.0.1:16384", "模拟器 adb 序列号(MuMu 默认 16384)")
+	harvestFlag  = flag.Bool("harvest", false, "启动时强制执行一次模拟器自动收割")
+	noAutoHarvest = flag.Bool("no-auto-harvest", false, "禁用令牌过期时的自动收割")
+	gameActivity = "com.netease.wotb.ewan/cn.ewan.supersdk.activity.SplashActivity"
+)
+
+func runCmd(name string, args ...string) (string, error) {
+	b, err := exec.Command(name, args...).CombinedOutput()
+	return string(b), err
+}
+
+func detectMuMuDir() string {
+	if *mumuDirFlag != "" {
+		return *mumuDirFlag
+	}
+	if v := os.Getenv("MUMU_DIR"); v != "" {
+		return v
+	}
+	var candidates []string
+	if out, err := exec.Command("reg", "query",
+		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`,
+		"/s", "/f", "MuMu", "/d", "/v", "InstallLocation").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(line, "InstallLocation") {
+				if _, val, ok := strings.Cut(line, "REG_SZ"); ok {
+					if d := strings.TrimSpace(val); d != "" {
+						candidates = append(candidates, d)
+					}
+				}
+			}
+		}
+	}
+	candidates = append(candidates, `E:\MuMuPlayer`, `C:\Program Files\Netease\MuMuPlayer-12.0`,
+		`C:\Program Files\Netease\MuMuPlayer`, `D:\MuMuPlayer`, `C:\MuMuPlayer`,
+		`D:\Program Files\Netease\MuMuPlayer-12.0`)
+	for _, p := range candidates {
+		if _, err := os.Stat(filepath.Join(p, "nx_main", "MuMuManager.exe")); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// pemCAHash 计算 OpenSSL subject_hash_old 风格的证书文件名(MD5(subject) 前 4 字节 LE)
+func pemCAHash(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return ""
+	}
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		return ""
+	}
+	h := md5.Sum(cert.RawSubject)
+	return fmt.Sprintf("%08x", binary.LittleEndian.Uint32(h[:4]))
+}
+
+func extractCAFile(chainPath, caPath string) {
+	if _, err := os.Stat(caPath); err == nil {
+		return
+	}
+	b, err := os.ReadFile(chainPath)
+	if err != nil {
+		return
+	}
+	var caPEM *pem.Block
+	rest := b
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		if blk.Type != "CERTIFICATE" {
+			continue
+		}
+		if caPEM == nil {
+			caPEM = blk
+		}
+		if c, err := x509.ParseCertificate(blk.Bytes); err == nil && c.IsCA {
+			caPEM = blk // 优先取 CA 证书
+		}
+	}
+	if caPEM != nil {
+		if err := os.WriteFile(caPath, pem.EncodeToMemory(caPEM), 0644); err == nil {
+			logf("[certs] 已导出模拟器用 CA: %s", caPath)
+		}
+	}
+}
+
+func autoHarvest() bool {
+	mumu := detectMuMuDir()
+	if mumu == "" {
+		logf("[auto-harvest] 未找到 MuMu 安装目录(用 -mumu 指定),放弃自动收割")
+		return false
+	}
+	adb := filepath.Join(mumu, "nx_main", "adb.exe")
+	if _, err := os.Stat(adb); err != nil {
+		if a, e2 := exec.LookPath("adb"); e2 == nil {
+			adb = a
+		} else {
+			logf("[auto-harvest] adb 不存在: %v", err)
+			return false
+		}
+	}
+	mm := filepath.Join(mumu, "nx_main", "MuMuManager.exe")
+	serial := *adbSerialFl
+	logf("[auto-harvest] MuMu=%s serial=%s", mumu, serial)
+
+	// 1) 启动模拟器(已运行则幂等)
+	if _, err := os.Stat(mm); err == nil {
+		if out, err := runCmd(mm, "api", "-v", "0", "launch_player"); err != nil {
+			logf("[auto-harvest] MuMu 启动: %v %s", err, strings.TrimSpace(out))
+		}
+	}
+	// 2) adb connect + 等待 device
+	deadline := time.Now().Add(150 * time.Second)
+	connected := false
+	for time.Now().Before(deadline) {
+		exec.Command(adb, "connect", serial).Run()
+		out, _ := runCmd(adb, "-s", serial, "get-state")
+		if strings.TrimSpace(out) == "device" {
+			connected = true
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if !connected {
+		logf("[auto-harvest] adb 无法连接 %s,放弃", serial)
+		return false
+	}
+	logf("[auto-harvest] adb 已连接")
+	sh := func(cmd string) string {
+		out, _ := runCmd(adb, "-s", serial, "shell", "su -c '"+cmd+"'")
+		return strings.TrimSpace(out)
+	}
+	// 3) hosts 指向本机(NAT 模拟器 10.0.2.2 = 宿主机)
+	sh("sed -i /cn1.plt/d /etc/hosts; echo 10.0.2.2 " + upstreamHN + " >> /etc/hosts")
+	// 4) 系统 CA 安装(apex tmpfs,重启模拟器后需重做,本步幂等)
+	caPath := filepath.Join(certDir, "ca.cer")
+	if _, err := os.Stat(caPath); err != nil {
+		logf("[auto-harvest] 缺少 %s,无法安装模拟器证书", caPath)
+		return false
+	}
+	hash := pemCAHash(caPath)
+	if hash == "" {
+		logf("[auto-harvest] CA hash 计算失败")
+		return false
+	}
+	exec.Command(adb, "-s", serial, "push", caPath, "/sdcard/wotb_ca.cer").Run()
+	sh("rm -rf /data/local/tmp/certs_tmp && mkdir /data/local/tmp/certs_tmp && " +
+		"cp /apex/com.android.conscrypt/cacerts/* /data/local/tmp/certs_tmp/ 2>/dev/null; " +
+		"cp /sdcard/wotb_ca.cer /data/local/tmp/certs_tmp/" + hash + ".0 && " +
+		"chmod 644 /data/local/tmp/certs_tmp/* && chown 0:0 /data/local/tmp/certs_tmp/* && " +
+		"mount -t tmpfs tmpfs /apex/com.android.conscrypt/cacerts && " +
+		"cp /data/local/tmp/certs_tmp/* /apex/com.android.conscrypt/cacerts/ && " +
+		"chown 0:0 /apex/com.android.conscrypt/cacerts/* && " +
+		"chmod 644 /apex/com.android.conscrypt/cacerts/* && " +
+		"chcon u:object_r:system_file:s0 /apex/com.android.conscrypt/cacerts/* && " +
+		"rm -f /sdcard/wotb_ca.cer")
+	logf("[auto-harvest] hosts + 系统 CA 已就绪(hash %s)", hash)
+	// 5) 拉起国服客户端(游客/已记住账号会自动登录)
+	exec.Command(adb, "-s", serial, "shell", "am", "start", "-n", gameActivity).Run()
+	// 6) 等待令牌刷新
+	deadline = time.Now().Add(300 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(3 * time.Second)
+		if st, err := os.Stat(tokenDisk); err == nil && time.Since(st.ModTime()) < 30*time.Second {
+			logf("[auto-harvest] ✓ 令牌已刷新。现在可以启动 Steam 游戏了")
+			return true
+		}
+	}
+	logf("[auto-harvest] 超时未收割到令牌——检查模拟器内游戏是否卡在弹窗/更新")
+	return false
+}
+
 // ---------- :443 ----------
 var tlsSrvConf *tls.Config
 
@@ -945,15 +1152,10 @@ func main() {
 
 	os.MkdirAll(logDir, 0755)
 	os.MkdirAll(capDir, 0755)
-	logf("===== WoTB PC 国服登录 =====")
+	logf("===== WoTB_PC_CN  =====")
 
 	// 红色免责警告(仅控制台,不写日志文件)
-	red := func(s string) string {
-		if enableVT() {
-			return "\x1b[91m" + s + "\x1b[0m"
-		}
-		return s
-	}
+	vtEnabled = enableVT()
 	fmt.Println(red("" +
 		"======================================================================\n" +
 		"  ⚠  警告 WARNING\n" +
@@ -979,13 +1181,10 @@ func main() {
 	if hint == "" {
 		hint = lanIP()
 	}
-	fmt.Println("---------------- 模拟器收割配置(单次,需root) ----------------")
-	fmt.Printf("  1) 模拟器 hosts:   %s cn1.plt.ms1shanghai.cn\n", hint)
-	fmt.Printf("  2) 安装系统证书:          %s\n", filepath.Join(certDir, "ca.cer"))
-	fmt.Println("  3) 在模拟器里登录一次游戏,日志出现 [harvest] 即收割成功")
-	fmt.Println("-------------------------------------------------------------")
+	_ = hint // 手动指引仅在收割失败分支打印
 
 	errs := make(chan error, 2)
+	ready := make(chan bool, 2)
 	go func() {
 		ln, err := net.Listen("tcp", normAddr(*httpAddr))
 		if err != nil {
@@ -993,6 +1192,7 @@ func main() {
 			return
 		}
 		logf("regions http server on %s", *httpAddr)
+		ready <- true
 		for {
 			c, err := ln.Accept()
 			if err != nil {
@@ -1012,6 +1212,7 @@ func main() {
 			return
 		}
 		logf("wgni proxy on %s (inject+passthrough)", *tlsAddr)
+		ready <- true
 		for {
 			c, err := ln.Accept()
 			if err != nil {
@@ -1021,7 +1222,65 @@ func main() {
 		}
 	}()
 
-	logf("[ok] 服务已启动。Steam 启动游戏 → 点「立即畅玩」，或自动登录。Ctrl+C 退出。")
+
+	// 等两个监听器就绪(带超时;监听失败则报错暂停退出)
+	gotReady := 0
+	for gotReady < 2 {
+		select {
+		case <-ready:
+			gotReady++
+		case err := <-errs:
+			logf("[!] %v", err)
+			fmt.Print(red("发生错误,按回车键退出..."))
+			stdin.ReadString('\n')
+			os.Exit(1)
+		case <-time.After(15 * time.Second):
+			logf("[!] 等待监听器就绪超时(端口被占/频繁重启?),服务可能未完全启动")
+			gotReady = 2
+		}
+	}
+
+	// 交互式询问:Steam 端能否自动登录
+	ans := "Y"
+	switch {
+	case *harvestFlag:
+		ans = "N" // 强制收割
+	case *noAutoHarvest:
+		ans = "Y" // 非交互模式,直接服务
+	default:
+		fmt.Println(green("Steam 端能否自动登录国服账号?(" + blue("Y") + green(" = 只启动服务,实测 24 小时以上未失效 / ") +
+			blue("N") + green(" = 先收割令牌再启动)")))
+		bad := 0
+		for {
+			fmt.Print(green("请选择 " + blue("Y") + green("/") + blue("N") + green(": ")))
+			line, err := stdin.ReadString('\n')
+			a := strings.ToUpper(strings.TrimSpace(line))
+			if a == "Y" || a == "N" {
+				ans = a
+				break
+			}
+			if err != nil || bad >= 2 {
+				ans = "Y" // stdin 不可用或多次无效输入 → 默认只启动服务
+				break
+			}
+			bad++
+			fmt.Println(green("无效输入,请输入 ") + blue("Y") + green(" 或 ") + blue("N"))
+		}
+	}
+
+	if ans == "N" {
+		logf("[auto-harvest] 进入收割流程")
+		if !autoHarvest() {
+			fmt.Println(red("---------------- 模拟器收割配置 ----------------"))
+			fmt.Println(red("  1) 模拟器 hosts 加一行:   <电脑IP> cn1.plt.ms1shanghai.cn"))
+			fmt.Println(red("  2) 安装系统证书:          proxy_certs\\ca.cer"))
+			fmt.Println(red("  3) 在模拟器里登录一次游戏,日志出现 [harvest] 即收割成功"))
+		}
+	}
+
+	logf("[ok] 服务已启动。Steam 启动游戏 → 点「立即畅玩」。Ctrl+C 退出。")
 	err = <-errs
 	logf("[!] %v", err)
+	fmt.Print(red("发生错误,按回车键退出..."))
+	stdin.ReadString('\n')
 }
