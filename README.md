@@ -48,7 +48,7 @@ Steam 启动 PC 客户端（国际服 exe 无需改动游戏文件*）
 - [Git Bash](https://git-scm.com/) 自带的 `openssl`（生成证书用）或任意 openssl
 - 可选：Go 1.20+（编译一体化版）
 
-## 部署步骤（一次性）
+## 命令脚本部署步骤（一次性）
 
 ### 1. hosts 劫持（管理员编辑 `C:\Windows\System32\drivers\etc\hosts`）
 
@@ -83,12 +83,15 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
 
 ## 日常使用
 
+### 使用命令启动
+
 1. 启动 `regions_http_server.py`（窗口 1）；
 2. 启动 `wgni_proxy.py inject`（窗口 2）；
 3. 首次使用Steam 启动游戏 → 登录页点「立即畅玩」→ 进入国服大厅。
    > 首次登录后，再次使用时，只需启动上述两个脚本，打开WoTB PC客户端即可自动登录。令牌理论上约 10 小时过期，但是目前暂未见过期，若PC端WoTB无法自动登录，或者进入后卡在“同步数据”，则先完成上面“模拟器收割”再启动游戏。
 
-或者下载Release中的 `WoTB_PC_CN.exe` 按以下步骤运行：
+## 使用 `WoTB_PC_CN.exe`
+
 1. 前置条件：MUMU模拟器+开启Root权限；
 2. 初次使用：运行exe，弹出的窗口中选择N，此时将会拉起MUMU模拟器，用户需要手动启动游戏、登录，直到进入车库；
 3. 首次登录：Steam启动WoTB PC端，点“立即畅玩”即可登录；
