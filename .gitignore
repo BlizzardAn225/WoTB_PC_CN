@@ -1,0 +1,22 @@
+# 个人会话凭证
+capture/
+token_cache.json
+sauth_live.json
+sauth_json*.json
+
+# 日志
+proxy_logs/
+*.log
+
+# 本机生成的证书与私钥
+proxy_certs/
+
+# 自动生成的 regions 便携包
+regions.yaml
+
+# 备份文件
+*.bak
+*.bak_common_merge
+
+# 编译产物
+*.exe
