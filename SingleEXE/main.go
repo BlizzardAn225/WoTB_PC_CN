@@ -1152,7 +1152,7 @@ func main() {
 
 	os.MkdirAll(logDir, 0755)
 	os.MkdirAll(capDir, 0755)
-	logf("===== WoTB_PC_CN  =====")
+	logf("===== WoTB_PC_CN =====")
 
 	// 红色免责警告(仅控制台,不写日志文件)
 	vtEnabled = enableVT()
